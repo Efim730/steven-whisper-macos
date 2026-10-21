@@ -17,8 +17,10 @@ on:
         default: 'b5130'
         required: true
 
+# Збірка виконує чужий код (whisper.cpp) — їй лише читання;
+# писати в релізи може тільки останній крок
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   build:
@@ -38,7 +40,9 @@ jobs:
     runs-on: macos-latest
     steps:
       - name: Source
-        run: git clone --depth 1 --branch "${{ inputs.whisper_ref }}" https://github.com/ggml-org/whisper.cpp src
+        run: |
+          git clone --depth 1 --branch "${{ inputs.whisper_ref }}" https://github.com/ggml-org/whisper.cpp src
+          echo "- whisper.cpp ${{ inputs.whisper_ref }}: commit $(git -C src rev-parse HEAD)" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Build
         run: |
@@ -95,6 +99,8 @@ jobs:
   release:
     needs: build
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - uses: actions/download-artifact@v4
         with:
@@ -107,7 +113,9 @@ jobs:
           gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 || \
             gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --title "whisper-cli for macOS (${{ inputs.whisper_ref }})" \
               --notes "Static whisper-cli builds of whisper.cpp ${{ inputs.whisper_ref }} with Metal, for the Steven panel."
-          gh release upload "$TAG" whisper-cli-macos-*.zip --repo "$GITHUB_REPOSITORY" --clobber
+          # Без --clobber: панелі покупців звіряють SHA-256 саме цих файлів, і
+          # підмінені повторним запуском zip зламали б їм завантаження. Нова збірка — новий тег
+          gh release upload "$TAG" whisper-cli-macos-*.zip --repo "$GITHUB_REPOSITORY"
           {
             echo "### Release $TAG"
             for f in whisper-cli-macos-*.zip; do
