@@ -1,0 +1,117 @@
+# Готовий whisper-cli для macOS — щоб покупцям не ставити Homebrew.
+#
+# whisper.cpp не випускає програм під macOS, тож збираємо їх тут: один
+# самодостатній файл (статично, Metal вбудований), без сторонніх dylib.
+# Запуск: Actions → «whisper-cli for macOS» → Run workflow. Результат —
+# реліз цього репозиторію з двома zip і їхніми SHA-256 у підсумку запуску.
+# Репозиторій має бути ПУБЛІЧНИМ: панелі покупців качають файли без входу.
+# URL і SHA-256 потім вписуються в src/ui/tabs/captions.js (NS.downloads.whisper).
+
+name: whisper-cli for macOS
+
+on:
+  workflow_dispatch:
+    inputs:
+      whisper_ref:
+        description: 'Тег whisper.cpp — той самий, що в Windows-збірці панелі'
+        default: 'b5130'
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          # Обидві збірки — на Apple Silicon: Intel-раннери GitHub виводить з ужитку,
+          # тож x86_64 збирається крос-компіляцією й перевіряється під Rosetta
+          - arch: arm64
+            cmake_arch: arm64
+            cpu_flags: ''
+          - arch: x64
+            cmake_arch: x86_64
+            # Haswell (2013) і новіші — усі Intel-Mac, на яких іде AE 2022+
+            cpu_flags: '-DGGML_AVX=ON -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON'
+    runs-on: macos-latest
+    steps:
+      - name: Source
+        run: git clone --depth 1 --branch "${{ inputs.whisper_ref }}" https://github.com/ggml-org/whisper.cpp src
+
+      - name: Build
+        run: |
+          cmake -S src -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_OSX_ARCHITECTURES=${{ matrix.cmake_arch }} \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=11.0 \
+            -DBUILD_SHARED_LIBS=OFF \
+            -DGGML_NATIVE=OFF \
+            -DGGML_METAL=ON \
+            -DGGML_METAL_EMBED_LIBRARY=ON \
+            -DWHISPER_BUILD_TESTS=OFF \
+            -DWHISPER_BUILD_SERVER=OFF \
+            -DWHISPER_SDL2=OFF \
+            ${{ matrix.cpu_flags }}
+          cmake --build build --config Release --target whisper-cli -j 4
+
+      - name: Check and package
+        run: |
+          set -e
+          mkdir out
+          cp build/bin/whisper-cli out/whisper-cli
+          lipo -info out/whisper-cli
+          otool -L out/whisper-cli
+          # Лише системні бібліотеки: інакше на машині покупця програма не запуститься
+          if otool -L out/whisper-cli | tail -n +2 | grep -Ev '^\s*/(System|usr/lib)/'; then
+            echo "::error::whisper-cli links a non-system library"; exit 1
+          fi
+          codesign --force --sign - out/whisper-cli
+          if [ "${{ matrix.arch }}" = "x64" ]; then
+            softwareupdate --install-rosetta --agree-to-license >/dev/null 2>&1 || true
+          fi
+          # Запускається взагалі (код < 128: не впав на завантаженні бібліотек)
+          set +e
+          out/whisper-cli -h >/dev/null 2>&1; code=$?
+          set -e
+          echo "whisper-cli -h exit code: $code"
+          if [ $code -ge 128 ]; then echo "::error::whisper-cli does not start"; exit 1; fi
+          (cd out && zip -9 "../whisper-cli-macos-${{ matrix.arch }}.zip" whisper-cli)
+          SHA=$(shasum -a 256 "whisper-cli-macos-${{ matrix.arch }}.zip" | cut -d' ' -f1)
+          SIZE=$(stat -f%z "whisper-cli-macos-${{ matrix.arch }}.zip")
+          {
+            echo "### darwin-${{ matrix.arch }}"
+            echo "- file: whisper-cli-macos-${{ matrix.arch }}.zip"
+            echo "- sha256: \`$SHA\`"
+            echo "- bytes: $SIZE"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: whisper-cli-macos-${{ matrix.arch }}
+          path: whisper-cli-macos-${{ matrix.arch }}.zip
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: whisper-macos-${{ inputs.whisper_ref }}
+        run: |
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 || \
+            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --title "whisper-cli for macOS (${{ inputs.whisper_ref }})" \
+              --notes "Static whisper-cli builds of whisper.cpp ${{ inputs.whisper_ref }} with Metal, for the Steven panel."
+          gh release upload "$TAG" whisper-cli-macos-*.zip --repo "$GITHUB_REPOSITORY" --clobber
+          {
+            echo "### Release $TAG"
+            for f in whisper-cli-macos-*.zip; do
+              echo "- https://github.com/$GITHUB_REPOSITORY/releases/download/$TAG/$f"
+              echo "  sha256 \`$(sha256sum "$f" | cut -d' ' -f1)\`, bytes $(stat -c%s "$f")"
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
