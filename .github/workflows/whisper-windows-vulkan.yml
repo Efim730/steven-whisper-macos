@@ -23,20 +23,25 @@ on:
         default: '1.4.357.0'
         required: true
 
+# Збірка виконує чужий код (whisper.cpp, інсталятор SDK) — їй лише читання;
+# писати в релізи може тільки останній крок
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   build:
     runs-on: windows-2025
     steps:
       - name: Source
-        run: git clone --depth 1 --branch "${{ inputs.whisper_ref }}" https://github.com/ggml-org/whisper.cpp src
+        run: |
+          git clone --depth 1 --branch "${{ inputs.whisper_ref }}" https://github.com/ggml-org/whisper.cpp src
+          Add-Content $env:GITHUB_STEP_SUMMARY "- whisper.cpp ${{ inputs.whisper_ref }}: commit $(git -C src rev-parse HEAD)"
 
       - name: Vulkan SDK
         run: |
           $ver = '${{ inputs.vulkan_sdk }}'
           curl.exe -fsSL -o "$env:RUNNER_TEMP\vulkan-sdk.exe" "https://sdk.lunarg.com/sdk/download/$ver/windows/vulkansdk-windows-X64-$ver.exe"
+          Add-Content $env:GITHUB_STEP_SUMMARY "- Vulkan SDK ${ver}: sha256 $((Get-FileHash "$env:RUNNER_TEMP\vulkan-sdk.exe" -Algorithm SHA256).Hash.ToLower())"
           Start-Process -Wait -FilePath "$env:RUNNER_TEMP\vulkan-sdk.exe" -ArgumentList '--accept-licenses', '--default-answer', '--confirm-command', 'install'
           if (-not (Test-Path "C:\VulkanSDK\$ver\Bin\glslc.exe")) { Write-Output "::error::Vulkan SDK is not installed"; exit 1 }
           Add-Content $env:GITHUB_ENV "VULKAN_SDK=C:\VulkanSDK\$ver"
@@ -118,6 +123,8 @@ jobs:
   release:
     needs: build
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - uses: actions/download-artifact@v4
         with:
@@ -130,7 +137,9 @@ jobs:
           gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 || \
             gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --title "whisper-cli for Windows with Vulkan (${{ inputs.whisper_ref }})" \
               --notes "Static whisper-cli.exe of whisper.cpp ${{ inputs.whisper_ref }} with Vulkan (AMD and Intel graphics), for the Steven panel."
-          gh release upload "$TAG" whisper-cli-win-vulkan-*.zip --repo "$GITHUB_REPOSITORY" --clobber
+          # Без --clobber: панелі покупців звіряють SHA-256 саме цього файлу, і
+          # підмінений повторним запуском zip зламав би їм завантаження. Нова збірка — новий тег
+          gh release upload "$TAG" whisper-cli-win-vulkan-*.zip --repo "$GITHUB_REPOSITORY"
           {
             echo "### Release $TAG"
             for f in whisper-cli-win-vulkan-*.zip; do
