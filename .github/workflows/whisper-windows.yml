@@ -1,0 +1,218 @@
+# Готові whisper-cli для Windows: процесор, NVIDIA (CUDA) і AMD/Intel (Vulkan) — з маніфестом UTF-8.
+#
+# Консольна програма Windows отримує аргументи в кодовій сторінці системи, а не в
+# Unicode. Тож «C:\Users\Єфим\…» на англійській Windows ставав «C:\Users\????\…»,
+# а підказка «Еее, ну, ммм…» (слова-паразити в Timing) доходила сміттям навіть на
+# українській. Маніфест activeCodePage=UTF-8 (Windows 10 1903+) дає програмі
+# аргументи й шляхи в UTF-8 — так, як whisper.cpp їх і чекає.
+#   cpu, cuda — офіційні збірки whisper.cpp (звіряємо SHA-256), лише з маніфестом;
+#   vulkan    — збираємо самі: один статичний whisper-cli.exe (див. коментарі нижче).
+# Запуск: Actions → «whisper-cli for Windows» → Run workflow. Результат — реліз
+# whisper-windows-<тег>-<ревізія> із трьома zip і їхніми SHA-256 у підсумку запуску.
+# Репозиторій має бути ПУБЛІЧНИМ: панелі покупців качають файли без входу.
+# URL і SHA-256 потім вписуються в src/ui/tabs/captions.js (NS.downloads.whisper / whisperCuda / whisperVulkan).
+
+name: whisper-cli for Windows
+
+on:
+  workflow_dispatch:
+    inputs:
+      whisper_ref:
+        description: 'Тег whisper.cpp — той самий, що в збірках для Mac'
+        default: 'b5130'
+        required: true
+      revision:
+        description: 'Ревізія релізу: наявні файли не перезаписуються, нова збірка — нова ревізія'
+        default: 'r2'
+        required: true
+      cpu_sha256:
+        description: 'SHA-256 офіційного whisper-bin-x64.zip цього тегу'
+        default: 'f9ec6c52a2e949b62ab51fa21d0d497958f9e41c3010c157c4e42932d5316f3c'
+        required: true
+      cuda_sha256:
+        description: 'SHA-256 офіційного whisper-cublas-11.8.0-bin-x64.zip цього тегу'
+        default: '0b29b2175bb17ec26da29677cbc7c467c57d103245144d62a49a703f6bc3fdae'
+        required: true
+      vulkan_sdk:
+        description: 'Версія Vulkan SDK від LunarG (потрібна лише для збірки)'
+        default: '1.4.357.0'
+        required: true
+
+# Збірка виконує чужий код (whisper.cpp, інсталятор SDK) — їй лише читання;
+# писати в релізи може тільки останній крок
+permissions:
+  contents: read
+
+jobs:
+  build:
+    strategy:
+      fail-fast: true
+      matrix:
+        kind: [cpu, cuda, vulkan]
+    runs-on: windows-2025
+    steps:
+      - name: Source
+        run: |
+          git clone --depth 1 --branch "${{ inputs.whisper_ref }}" https://github.com/ggml-org/whisper.cpp src
+          Add-Content $env:GITHUB_STEP_SUMMARY "- ${{ matrix.kind }}: whisper.cpp ${{ inputs.whisper_ref }}, commit $(git -C src rev-parse HEAD)"
+
+      - name: Official build (cpu, cuda)
+        if: matrix.kind != 'vulkan'
+        run: |
+          $name = @{ cpu = 'whisper-bin-x64.zip'; cuda = 'whisper-cublas-11.8.0-bin-x64.zip' }['${{ matrix.kind }}']
+          $want = @{ cpu = '${{ inputs.cpu_sha256 }}'; cuda = '${{ inputs.cuda_sha256 }}' }['${{ matrix.kind }}']
+          curl.exe -fsSL -o official.zip "https://github.com/ggml-org/whisper.cpp/releases/download/${{ inputs.whisper_ref }}/$name"
+          $sha = (Get-FileHash official.zip -Algorithm SHA256).Hash.ToLower()
+          if ($sha -ne $want) { Write-Output "::error::$name sha256 $sha, expected $want"; exit 1 }
+          7z x official.zip -oout | Out-Null
+          $exe = Get-ChildItem out -Recurse -Filter whisper-cli.exe | Select-Object -First 1
+          if (-not $exe) { Write-Output "::error::no whisper-cli.exe in $name"; exit 1 }
+          Add-Content $env:GITHUB_ENV "CLI=$($exe.FullName)"
+
+      - name: Vulkan SDK
+        if: matrix.kind == 'vulkan'
+        run: |
+          $ver = '${{ inputs.vulkan_sdk }}'
+          curl.exe -fsSL -o "$env:RUNNER_TEMP\vulkan-sdk.exe" "https://sdk.lunarg.com/sdk/download/$ver/windows/vulkansdk-windows-X64-$ver.exe"
+          Add-Content $env:GITHUB_STEP_SUMMARY "- Vulkan SDK ${ver}: sha256 $((Get-FileHash "$env:RUNNER_TEMP\vulkan-sdk.exe" -Algorithm SHA256).Hash.ToLower())"
+          Start-Process -Wait -FilePath "$env:RUNNER_TEMP\vulkan-sdk.exe" -ArgumentList '--accept-licenses', '--default-answer', '--confirm-command', 'install'
+          if (-not (Test-Path "C:\VulkanSDK\$ver\Bin\glslc.exe")) { Write-Output "::error::Vulkan SDK is not installed"; exit 1 }
+          Add-Content $env:GITHUB_ENV "VULKAN_SDK=C:\VulkanSDK\$ver"
+          Add-Content $env:GITHUB_PATH "C:\VulkanSDK\$ver\Bin"
+
+      - name: Build (vulkan)
+        if: matrix.kind == 'vulkan'
+        run: |
+          # /MT замість /MD: без VC++ Redistributable на машині покупця.
+          # OpenMP вимкнено: MSVC дає його лише як vcomp140.dll, у ggml є свій пул потоків.
+          # AVX2 — Haswell (2013) і новіші: усі процесори, на яких іде AE 2022+
+          cmake -S src -B build -A x64 `
+            -DCMAKE_POLICY_DEFAULT_CMP0091=NEW `
+            -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded `
+            -DBUILD_SHARED_LIBS=OFF `
+            -DGGML_NATIVE=OFF `
+            -DGGML_AVX=ON -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON `
+            -DGGML_OPENMP=OFF `
+            -DGGML_VULKAN=ON `
+            -DWHISPER_BUILD_TESTS=OFF `
+            -DWHISPER_BUILD_SERVER=OFF `
+            -DWHISPER_SDL2=OFF
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          cmake --build build --config Release --target whisper-cli -j 4
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          # Та сама тека Release, що в офіційних zip: панель шукає whisper-cli саме там
+          New-Item -ItemType Directory out\Release | Out-Null
+          Copy-Item build\bin\Release\whisper-cli.exe out\Release\
+          Copy-Item src\LICENSE out\Release\LICENSE.txt
+          Add-Content $env:GITHUB_ENV "CLI=$((Resolve-Path out\Release\whisper-cli.exe).Path)"
+
+      - name: UTF-8 manifest
+        run: |
+          $manifest = @'
+          <?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+          <assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+            <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3">
+              <security><requestedPrivileges><requestedExecutionLevel level="asInvoker" uiAccess="false"/></requestedPrivileges></security>
+            </trustInfo>
+            <application xmlns="urn:schemas-microsoft-com:asm.v3">
+              <windowsSettings>
+                <activeCodePage xmlns="http://schemas.microsoft.com/SMI/2019/WindowsSettings">UTF-8</activeCodePage>
+              </windowsSettings>
+            </application>
+          </assembly>
+          '@
+          Set-Content -Path utf8.manifest -Value $manifest -Encoding utf8
+          $mt = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin" -Recurse -Filter mt.exe | Where-Object { $_.FullName -match '\\x64\\' } | Sort-Object FullName -Descending | Select-Object -First 1
+          & $mt.FullName -nologo -manifest utf8.manifest "-outputresource:$env:CLI;#1"
+          if ($LASTEXITCODE) { Write-Output "::error::mt.exe failed"; exit 1 }
+
+      - name: Check and package
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $dir = Split-Path $env:CLI
+          # Лише системні DLL (і те, що лежить поруч), vulkan-1.dll — від драйвера відеокарти
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $dumpbin = & $vswhere -latest -products * -find 'VC\Tools\MSVC\*\bin\Hostx64\x64\dumpbin.exe' | Select-Object -First 1
+          $deps = & $dumpbin /nologo /dependents $env:CLI | Where-Object { $_ -match '^\s+\S+\.dll\s*$' } | ForEach-Object { $_.Trim() }
+          Write-Output "Depends on: $($deps -join ', ')"
+          if ('${{ matrix.kind }}' -eq 'vulkan') {
+            if (-not ($deps -contains 'vulkan-1.dll')) { Write-Output "::error::whisper-cli is built without Vulkan"; exit 1 }
+            foreach ($d in $deps) {
+              if ($d -eq 'vulkan-1.dll' -or $d -like 'api-ms-win-core-*') { continue }
+              if ($d -match '^(vcruntime|msvcp|vcomp|concrt|ucrtbase|api-ms-win-crt)' -or -not (Test-Path "$env:SystemRoot\System32\$d")) {
+                Write-Output "::error::whisper-cli links a non-system library: $d"; exit 1
+              }
+            }
+            if (-not (Test-Path "$env:SystemRoot\System32\vulkan-1.dll")) {
+              $loader = Get-ChildItem $env:VULKAN_SDK -Recurse -Filter vulkan-1.dll | Select-Object -First 1
+              if ($loader) { Copy-Item $loader.FullName $dir }
+            }
+          }
+
+          # Маніфест UTF-8 справді працює: шлях і підказка кирилицею (CUDA без відеокарти не запуститься — лише -h)
+          $ErrorActionPreference = 'Continue'
+          & $env:CLI -h *> $null
+          Write-Output "whisper-cli -h exit code: $LASTEXITCODE"
+          if ($LASTEXITCODE -lt 0 -or $LASTEXITCODE -gt 255) {
+            # Офіційна CUDA-збірка без драйвера NVIDIA (на раннері його немає) може й не стартувати
+            if ('${{ matrix.kind }}' -eq 'cuda') { Write-Output "::warning::CUDA whisper-cli does not start without an NVIDIA driver" }
+            else { Write-Output "::error::whisper-cli does not start"; exit 1 }
+          }
+          if ('${{ matrix.kind }}' -ne 'cuda') {
+            New-Item -ItemType Directory 'тест Єфим' | Out-Null
+            Copy-Item src\samples\jfk.wav 'тест Єфим\звук.wav'
+            curl.exe -fsSL -o 'тест Єфим\модель.bin' "https://huggingface.co/ggerganov/whisper.cpp/resolve/5359861c739e955e79d9a303bcbc70fb988958b1/ggml-base-q8_0.bin"
+            $base = (Resolve-Path 'тест Єфим').Path
+            & $env:CLI -m "$base\модель.bin" -f "$base\звук.wav" -l en -t 4 -of "$base\вихід" -np -ojf -dtw base -nfa --prompt 'Еее, ну, ммм... тобто' 2>&1 | Select-Object -Last 10
+            $ErrorActionPreference = 'Stop'
+            $text = (Get-Content "$base\вихід.json" -Raw | ConvertFrom-Json).transcription.text -join ''
+            Write-Output "Text: $text"
+            if ($text -notmatch 'ask not what your country') { Write-Output "::error::transcription with a Cyrillic path does not work"; exit 1 }
+            Remove-Item $dir\vulkan-1.dll -ErrorAction SilentlyContinue
+          }
+          $ErrorActionPreference = 'Stop'
+
+          # У zip — тека Release з усім, що лежить поруч із whisper-cli.exe (DLL офіційних збірок)
+          $zip = "whisper-cli-win-${{ matrix.kind }}-x64.zip"
+          $pkg = Join-Path $env:RUNNER_TEMP 'pkg'
+          New-Item -ItemType Directory "$pkg\Release" -Force | Out-Null
+          Copy-Item "$dir\*" "$pkg\Release\" -Recurse
+          Push-Location $pkg
+          7z a -tzip -mx=9 "$env:GITHUB_WORKSPACE\$zip" '.\Release\*' | Out-Null
+          Pop-Location
+          $sha = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
+          $size = (Get-Item $zip).Length
+          Add-Content $env:GITHUB_STEP_SUMMARY "### win32-x64 (${{ matrix.kind }})`n- file: $zip`n- sha256: ``$sha```n- bytes: $size`n- depends on: $($deps -join ', ')"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: whisper-cli-win-${{ matrix.kind }}-x64
+          path: whisper-cli-win-${{ matrix.kind }}-x64.zip
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: whisper-windows-${{ inputs.whisper_ref }}-${{ inputs.revision }}
+        run: |
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 || \
+            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --title "whisper-cli for Windows (${{ inputs.whisper_ref }}, ${{ inputs.revision }})" \
+              --notes "whisper-cli.exe of whisper.cpp ${{ inputs.whisper_ref }} for the Steven panel with a UTF-8 manifest: CPU and CUDA (official builds) and Vulkan (AMD and Intel graphics)."
+          # Без --clobber: панелі покупців звіряють SHA-256 саме цих файлів, і
+          # підмінені повторним запуском zip зламали б їм завантаження. Нова збірка — нова ревізія
+          gh release upload "$TAG" whisper-cli-win-*.zip --repo "$GITHUB_REPOSITORY"
+          {
+            echo "### Release $TAG"
+            for f in whisper-cli-win-*.zip; do
+              echo "- https://github.com/$GITHUB_REPOSITORY/releases/download/$TAG/$f"
+              echo "  sha256 \`$(sha256sum "$f" | cut -d' ' -f1)\`, bytes $(stat -c%s "$f")"
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
